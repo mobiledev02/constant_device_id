@@ -27,6 +27,13 @@ class ConstantDeviceIdPlugin : FlutterPlugin, MethodCallHandler {
          * Reference: https://dashif.org/identifiers/content_protection/
          */
         private val WIDEVINE_UUID = UUID(-0x121074568629b532L, -0x5c37d8232ae2de13L)
+
+        /**
+         * Cache the Widevine ID at the process level to avoid redundant
+         * expensive MediaDrm allocations and driver calls.
+         */
+        @Volatile
+        private var cachedWidevineId: String? = null
     }
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -42,10 +49,19 @@ class ConstantDeviceIdPlugin : FlutterPlugin, MethodCallHandler {
     }
 
     private fun getWidevineId(result: Result) {
+        cachedWidevineId?.let {
+            result.success(it)
+            return
+        }
+
         try {
             val drm = MediaDrm(WIDEVINE_UUID)
             val widevineId = drm.getPropertyByteArray(MediaDrm.PROPERTY_DEVICE_UNIQUE_ID)
-            val encoded = Base64.encodeToString(widevineId, Base64.NO_WRAP)
+            val encoded = if (widevineId != null && widevineId.isNotEmpty()) {
+                Base64.encodeToString(widevineId, Base64.NO_WRAP)
+            } else {
+                null
+            }
 
             // MediaDrm.close() was added in API 28; use release() on older versions.
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -55,6 +71,9 @@ class ConstantDeviceIdPlugin : FlutterPlugin, MethodCallHandler {
                 drm.release()
             }
 
+            if (encoded != null) {
+                cachedWidevineId = encoded
+            }
             result.success(encoded)
         } catch (e: Exception) {
             result.error("DRM_ERROR", e.message, null)

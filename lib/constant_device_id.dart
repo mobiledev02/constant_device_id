@@ -10,11 +10,13 @@
 ///
 /// final String id = await ConstantDeviceId.getId();
 /// ```
-library constant_device_id;
+library;
 
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -41,17 +43,29 @@ export 'src/constant_device_id_platform_interface.dart'
 class ConstantDeviceId {
   ConstantDeviceId._();
 
-  static const _secureStorage = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  static const _defaultSecureStorage = FlutterSecureStorage(
+    aOptions: AndroidOptions(),
     iOptions: IOSOptions(
       /// The Keychain item is kept after the app is uninstalled on iOS.
       accessibility: KeychainAccessibility.first_unlock,
     ),
   );
 
+  @visibleForTesting
+  static FlutterSecureStorage secureStorage = _defaultSecureStorage;
+
   static const _storageKey = 'constant_device_id_v1';
 
-  /// Returns a permanent device identifier as a 64-character hex string.
+  static String? _cachedId;
+  static Future<String>? _ongoingFetch;
+  static int _epoch = 0;
+
+  /// Returns the in-memory cached ID if available without making any async
+  /// calls or platform channel queries, or `null` if [getId] has not resolved
+  /// yet or if the cache was cleared.
+  static String? get cachedId => _cachedId;
+
+  /// Returns a permanent device identifier as a 64-character hex string (or UUID).
   ///
   /// The value is a SHA-256 hash of the underlying hardware identifier so that
   /// the raw hardware ID is never exposed or stored.
@@ -59,40 +73,46 @@ class ConstantDeviceId {
   /// This method is safe to call from any isolate and is idempotent — repeated
   /// calls return the same value as long as the hardware and storage are intact.
   ///
+  /// Subsequent calls return the in-memory cached value immediately without
+  /// performing platform channel calls or disk I/O, unless [forceRefresh] is `true`.
+  /// Concurrent calls before the first call finishes are automatically deduplicated
+  /// to share a single in-flight resolution.
+  ///
   /// Throws only if all four layers fail simultaneously, which is an
   /// unrecoverable device state.
-  static Future<String> getId() async {
-    // Layer 0: Widevine DRM hardware ID (Android — survives uninstall/reinstall)
-    final widevineId = await _getWidevineId();
-    if (widevineId != null) return widevineId;
-
-    // Layer 1: Secure Storage (iOS Keychain survives reinstall natively)
-    try {
-      final secureId = await _secureStorage.read(key: _storageKey);
-      if (secureId != null && secureId.isNotEmpty) return secureId;
-    } catch (_) {}
-
-    // Layer 2: SharedPreferences fallback
-    final prefs = await SharedPreferences.getInstance();
-    final prefId = prefs.getString(_storageKey);
-    if (prefId != null && prefId.isNotEmpty) {
-      // Promote to secure storage for future reads
-      try {
-        await _secureStorage.write(key: _storageKey, value: prefId);
-      } catch (_) {}
-      return prefId;
+  static Future<String> getId({bool forceRefresh = false}) async {
+    if (!forceRefresh && _cachedId != null) {
+      return _cachedId!;
+    }
+    if (!forceRefresh && _ongoingFetch != null) {
+      return _ongoingFetch!;
     }
 
-    // Layer 3: Generate a new UUID and persist it in both stores
-    final newId = const Uuid().v4();
+    final currentEpoch = _epoch;
+    final fetchFuture = _resolveId();
+    _ongoingFetch = fetchFuture;
+
     try {
-      await _secureStorage.write(key: _storageKey, value: newId);
-    } catch (_) {}
-    await prefs.setString(_storageKey, newId);
-    return newId;
+      final id = await fetchFuture;
+      if (_epoch == currentEpoch) {
+        _cachedId = id;
+      }
+      return id;
+    } finally {
+      if (identical(_ongoingFetch, fetchFuture)) {
+        _ongoingFetch = null;
+      }
+    }
   }
 
-  /// Clears the device ID from Secure Storage and SharedPreferences.
+  /// Clears only the in-memory cached device ID without modifying persistent storage.
+  static void clearCache() {
+    _epoch++;
+    _cachedId = null;
+    _ongoingFetch = null;
+  }
+
+  /// Clears the device ID from in-memory cache, Secure Storage, and SharedPreferences.
   ///
   /// The next call to [getId] on Android will still return the same
   /// hardware-derived ID because the Widevine layer is not affected.
@@ -100,16 +120,68 @@ class ConstantDeviceId {
   /// On iOS, clearing resets the stored ID; the next [getId] call generates
   /// and persists a new UUID.
   static Future<void> reset() async {
-    try {
-      await _secureStorage.delete(key: _storageKey);
-    } catch (_) {}
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_storageKey);
+    _epoch++;
+    _cachedId = null;
+    _ongoingFetch = null;
+
+    await Future.wait([
+      secureStorage.delete(key: _storageKey).catchError((_) {}),
+      () async {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.remove(_storageKey);
+        } catch (_) {}
+      }(),
+    ]);
   }
 
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
+
+  static Future<String> _resolveId() async {
+    // Layer 0: Widevine DRM hardware ID (Android — survives uninstall/reinstall)
+    final widevineId = await _getWidevineId();
+    if (widevineId != null && widevineId.isNotEmpty) {
+      return widevineId;
+    }
+
+    // Layer 1: Secure Storage (iOS Keychain survives reinstall natively)
+    try {
+      final secureId = await secureStorage.read(key: _storageKey);
+      if (secureId != null && secureId.isNotEmpty) {
+        return secureId;
+      }
+    } catch (_) {}
+
+    // Layer 2: SharedPreferences fallback
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final prefId = prefs.getString(_storageKey);
+      if (prefId != null && prefId.isNotEmpty) {
+        // Promote to secure storage for future reads asynchronously
+        unawaited(
+          secureStorage
+              .write(key: _storageKey, value: prefId)
+              .catchError((_) {}),
+        );
+        return prefId;
+      }
+    } catch (_) {}
+
+    // Layer 3: Generate a new UUID and persist it in both stores concurrently
+    final newId = const Uuid().v4();
+    await Future.wait([
+      secureStorage.write(key: _storageKey, value: newId).catchError((_) {}),
+      () async {
+        try {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString(_storageKey, newId);
+        } catch (_) {}
+      }(),
+    ]);
+    return newId;
+  }
 
   static Future<String?> _getWidevineId() async {
     try {

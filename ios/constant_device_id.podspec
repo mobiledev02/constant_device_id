@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'constant_device_id'
-  s.version          = '0.1.0'
+  s.version          = '0.2.0'
   s.summary          = 'A Flutter plugin for permanent device identification.'
   s.description      = <<-DESC
     A Flutter plugin that provides a permanent device identifier that persists
@@ -11,7 +11,7 @@ Pod::Spec.new do |s|
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'Your Organization' => 'dev@your-org.com' }
   s.source           = { :path => '.' }
-  s.source_files     = 'Classes/**/*'
+  s.source_files     = 'constant_device_id/Sources/constant_device_id/**/*.swift'
   s.dependency 'Flutter'
   s.platform         = :ios, '12.0'
 
